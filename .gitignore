@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Pytest
+.pytest_cache/
+
+# Logs
+logs/
+*.log
+
+# Outputs
+outputs/
+
+# Datasets
+datasets/raw/
+datasets/processed/
+
+# Model Weights
+models/checkpoints/
+models/trained/
+models/weights/
