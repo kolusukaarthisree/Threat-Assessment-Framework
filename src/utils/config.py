@@ -4,31 +4,39 @@ Centralized Configuration Management Module
 This module serves as the single entry point for loading, validating, and
 accessing all configuration files used throughout the Threat Assessment Framework.
 
-It sits at the infrastructure layer of the dependency graph:
-    config.py
-        ▲
-        │
-    Every framework module depends on it.
+Architecture Position:
+    schemas.py → config.py → logger.py → interfaces.py → base_module.py
 
 Design Philosophy:
-    - Instance-based: No global state. Each experiment can hold its own config.
+    - Immutable: Configuration is frozen after loading; no runtime mutation.
     - Fail Fast: Invalid YAML or missing required files halt execution immediately.
-    - Immutability: Configuration is frozen after loading.
-    - Explicit Ownership: No Singletons. Loader instances own their cached config.
-
-Future Enhancements (Not yet implemented):
-    - Schema Validation: Ensure 'confidence' keys are floats, 'paths' exist, etc.
-    - Default Values: Merge loaded configs with a base defaults.yaml to fill gaps.
+    - Instance-based: No global state. Each experiment can hold its own config.
+    - Strongly Typed: Public API is strongly typed; internal parser uses `Any`.
+    - Explicit Ownership: Loader instances own their cached configuration.
+    - Mapping Protocol: ConfigNode behaves like a read-only Mapping.
 
 Dependencies:
-    - Python Standard Library (pathlib, typing)
+    - Python Standard Library (pathlib, typing, types, collections.abc)
     - PyYAML (for parsing YAML files)
 """
 
+from __future__ import annotations
+
 import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Union
-import warnings
+from typing import Any
+from types import MappingProxyType
+from collections.abc import Iterator, Mapping
+
+
+# -----------------------------------------------------------------------------
+# Type Aliases (Simple, Practical)
+# -----------------------------------------------------------------------------
+
+# Internal parser values can be any valid YAML type.
+# The strong type guarantees come from ConfigNode and the public API.
+ConfigValue = Any
+JSONValue = Any
 
 
 # -----------------------------------------------------------------------------
@@ -56,20 +64,24 @@ class ConfigValidationError(ConfigError):
 
 
 # -----------------------------------------------------------------------------
-# Internal Helpers
+# Internal Helper Functions
 # -----------------------------------------------------------------------------
 
-def _resolve_config_path(config_dir: Union[str, Path]) -> Path:
+def _resolve_config_path(config_dir: str | Path) -> Path:
     """
     Resolves the configuration directory path.
 
     If a relative path is provided, it is resolved against the current
-    working directory. For absolute paths, it is used as-is.
+    working directory. Absolute paths are returned as-is.
+
+    Args:
+        config_dir: The configuration directory path.
+
+    Returns:
+        An absolute, resolved Path object.
     """
     path = Path(config_dir)
     if not path.is_absolute():
-        # Resolve relative to the current working directory.
-        # This makes `python project/main.py` work predictably if run from root.
         path = Path.cwd() / path
     return path.resolve()
 
@@ -79,6 +91,12 @@ def _validate_required_files(config_dir: Path) -> None:
     Ensures the core configuration files exist.
 
     Raises ConfigNotFoundError if the directory or any core file is missing.
+
+    Args:
+        config_dir: The resolved configuration directory path.
+
+    Raises:
+        ConfigNotFoundError: If the directory or required files are missing.
     """
     if not config_dir.exists():
         raise ConfigNotFoundError(
@@ -86,7 +104,6 @@ def _validate_required_files(config_dir: Path) -> None:
             "Ensure the path is correct and the directory exists."
         )
 
-    # Core required files (without the '_config' suffix in their stem)
     required_stems = {"system", "model", "thresholds", "dataset", "logging"}
     existing_files = {f.stem.replace("_config", "") for f in config_dir.glob("*.yaml")}
 
@@ -98,10 +115,22 @@ def _validate_required_files(config_dir: Path) -> None:
         )
 
 
-def _load_yaml_file(file_path: Path) -> Dict[str, Any]:
-    """Loads a single YAML file, raising a ConfigSyntaxError on failure."""
+def _load_yaml_file(file_path: Path) -> dict[str, Any]:
+    """
+    Loads a single YAML file.
+
+    Args:
+        file_path: Path to the YAML file.
+
+    Returns:
+        The parsed YAML content as a dictionary.
+
+    Raises:
+        ConfigSyntaxError: If the YAML is malformed.
+        ConfigNotFoundError: If the file cannot be read.
+    """
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with file_path.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
             if data is None:
                 return {}
@@ -122,124 +151,244 @@ def _load_yaml_file(file_path: Path) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Config Tree Builder
+# Configuration Tree Builders
 # -----------------------------------------------------------------------------
 
-def _build_config_tree(data: Any) -> Any:
+def _build_config_value(data: Any) -> Any:
     """
-    Recursively converts raw dicts/lists into ConfigNodes or lists thereof.
+    Recursively converts arbitrary data into a ConfigValue.
 
-    This separates the tree-building logic from the ConfigNode class,
-    keeping the data container lean.
+    This is the recursive helper for building configuration trees.
+    It handles:
+        - dictionaries → ConfigNode
+        - lists → lists of ConfigValue
+        - primitives → pass-through
+
+    Args:
+        data: The raw data to convert.
+
+    Returns:
+        A ConfigValue (ConfigNode, list, or primitive).
     """
     if isinstance(data, dict):
-        # Primitives (strings, ints, floats, bools) are stored as-is.
-        # Nested dicts become ConfigNodes.
-        processed = {}
+        processed: dict[str, Any] = {}
         for key, value in data.items():
             if not isinstance(key, str):
                 raise ConfigValidationError(
                     f"Configuration keys must be strings, found {type(key).__name__}."
                 )
-            processed[key] = _build_config_tree(value)
-        return ConfigNode(processed, _root=False)
-    elif isinstance(data, list):
-        return [_build_config_tree(item) for item in data]
-    else:
-        # Base case: int, float, str, bool, None
-        return data
+            processed[key] = _build_config_value(value)
+        return ConfigNode(processed)
+    if isinstance(data, list):
+        return [_build_config_value(item) for item in data]
+    return data
 
 
-# -----------------------------------------------------------------------------
-# Immutable Configuration Node
-# -----------------------------------------------------------------------------
-
-class ConfigNode:
+def _build_config_node(data: Mapping[str, Any]) -> ConfigNode:
     """
-    A recursive, immutable configuration container supporting attribute-style access.
+    Builds a root ConfigNode from a dictionary.
 
-    This class represents a frozen node in the configuration tree. Once created,
-    it cannot be modified, ensuring that runtime behavior is deterministic.
+    This is the top-level entry point for configuration construction.
+    It guarantees that the result is a ConfigNode, not a list or primitive.
+
+    Args:
+        data: A dictionary mapping keys to raw values.
+
+    Returns:
+        A ConfigNode representing the entire configuration tree.
+
+    Raises:
+        ConfigValidationError: If the input is not a dictionary.
+    """
+    if not isinstance(data, dict):
+        raise ConfigValidationError(
+            f"Root configuration must be a dictionary, got {type(data).__name__}."
+        )
+    # Use the recursive builder to process the dictionary
+    result = _build_config_value(data)
+    if not isinstance(result, ConfigNode):
+        # This should never happen because _build_config_value returns a ConfigNode for dicts
+        raise ConfigValidationError(
+            "Internal error: root configuration is not a ConfigNode."
+        )
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Immutable Configuration Node (Implements Mapping Protocol)
+# -----------------------------------------------------------------------------
+
+class ConfigNode(Mapping[str, Any]):
+    """
+    A recursive, immutable configuration container implementing Mapping.
+
+    This class represents a node in the configuration tree. It provides
+    attribute-style and dictionary-style access to nested values.
+
+    Implements the full Mapping protocol:
+        - __getitem__
+        - __iter__
+        - __len__
+        - __contains__ (inherited from Mapping)
+
+    Immutability is enforced both statically (frozen dataclass semantics)
+    and at runtime using MappingProxyType for the internal storage.
 
     Example:
         node = ConfigNode({"model": {"name": "YOLO11"}})
-        print(node.model.name)  # "YOLO11"
-        node.model.name = "New"  # Raises AttributeError
+        print(node.model.name)       # "YOLO11"
+        print(node["model"]["name"]) # "YOLO11"
+        print(len(node))             # 1
+        print(list(node))            # ["model"]
+        node.model.name = "New"      # Raises AttributeError
+
+    Attributes:
+        __data: A read-only mapping of keys to ConfigValue objects (name-mangled).
     """
 
-    def __init__(self, data: Dict[str, Any], _root: bool = True):
-        """
-        Initializes the ConfigNode with pre-validated data.
+    __slots__ = ("__data",)
 
-        Note: This expects `data` to already be processed by `_build_config_tree`.
-        Do not pass raw lists or primitives directly to this constructor.
+    def __init__(self, data: Mapping[str, Any]) -> None:
         """
-        object.__setattr__(self, '_data', data)
-        object.__setattr__(self, '_frozen', True)
+        Initializes a ConfigNode with a read-only mapping.
+
+        The provided mapping is copied and wrapped in MappingProxyType to
+        enforce immutability at runtime and ensure ownership.
+
+        Args:
+            data: A mapping of configuration keys to values.
+        """
+        # Copy the data first to ensure we own the state, then wrap in MappingProxyType
+        # This prevents external mutations to the original dict from affecting this node.
+        object.__setattr__(self, "__data", MappingProxyType(dict(data)))
 
     def __getattr__(self, key: str) -> Any:
-        """Provides attribute-style access to dictionary keys."""
-        if key in ['_data', '_frozen']:
+        """
+        Provides attribute-style access to configuration keys.
+
+        Args:
+            key: The attribute name.
+
+        Returns:
+            The configuration value for the given key.
+
+        Raises:
+            AttributeError: If the key does not exist.
+        """
+        if key in ("__data",):
             return object.__getattribute__(self, key)
 
-        data = object.__getattribute__(self, '_data')
-        if isinstance(data, dict) and key in data:
+        data = object.__getattribute__(self, "__data")
+        if key in data:
             return data[key]
 
-        if isinstance(data, dict):
-            raise AttributeError(
-                f"'{self.__class__.__name__}' has no attribute '{key}'. "
-                f"Available keys: {', '.join(data.keys())}"
-            )
         raise AttributeError(
-            f"'{self.__class__.__name__}' has no attribute '{key}'."
+            f"'{self.__class__.__name__}' has no attribute '{key}'. "
+            f"Available keys: {', '.join(data.keys())}"
         )
 
     def __setattr__(self, key: str, value: Any) -> None:
-        """Prevents modification, enforcing immutability."""
+        """
+        Prevents attribute assignment, enforcing immutability.
+
+        Raises:
+            AttributeError: Always raised.
+        """
         raise AttributeError(
             f"Configuration is immutable. Cannot assign '{key}' after initialization."
         )
 
     def __getitem__(self, key: str) -> Any:
-        """Supports dictionary-style access (e.g., config['model']) as a fallback."""
-        return self.__getattr__(key)
+        """
+        Provides dictionary-style access to configuration keys.
+
+        Args:
+            key: The key to look up.
+
+        Returns:
+            The configuration value for the given key.
+
+        Raises:
+            KeyError: If the key does not exist.
+        """
+        data = object.__getattribute__(self, "__data")
+        if key in data:
+            return data[key]
+        raise KeyError(key)
 
     def __setitem__(self, key: str, value: Any) -> None:
-        """Explicitly prevents item assignment for immutability."""
-        raise AttributeError(
+        """
+        Prevents item assignment, enforcing immutability.
+
+        Raises:
+            TypeError: Always raised.
+        """
+        raise TypeError(
             f"Configuration is immutable. Cannot assign '{key}' via item access."
         )
 
-    def __contains__(self, key: str) -> bool:
-        """Supports 'in' operator for checking nested keys."""
-        data = object.__getattribute__(self, '_data')
-        if isinstance(data, dict):
-            return key in data
-        return False
+    def __iter__(self) -> Iterator[str]:
+        """
+        Returns an iterator over the configuration keys.
+
+        This enables:
+            for key in config:
+                print(key)
+        """
+        data = object.__getattribute__(self, "__data")
+        return iter(data)
+
+    def __len__(self) -> int:
+        """
+        Returns the number of keys in this configuration node.
+
+        This enables:
+            len(config)
+        """
+        data = object.__getattribute__(self, "__data")
+        return len(data)
 
     def __repr__(self) -> str:
-        data = object.__getattribute__(self, '_data')
-        return f"ConfigNode({data})"
+        """Returns a compact string representation of the configuration node."""
+        data = object.__getattribute__(self, "__data")
+        keys = list(data.keys())
+        if len(keys) <= 3:
+            return f"ConfigNode(keys={keys})"
+        return f"ConfigNode(keys=[{', '.join(keys[:3])}, ...], size={len(keys)})"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def _convert_to_json(self, value: Any) -> Any:
         """
-        Recursively converts the ConfigNode tree back into a pure Python dict.
+        Recursively converts a ConfigValue to a JSON-serializable value.
 
-        Useful for serializing the loaded configuration for experiment logs.
+        This internal helper ensures type safety when converting nested structures.
+
+        Args:
+            value: The ConfigValue to convert.
+
+        Returns:
+            A JSONValue representation.
         """
-        data = object.__getattribute__(self, '_data')
-        if isinstance(data, dict):
-            return {
-                k: v.to_dict() if isinstance(v, ConfigNode) else v
-                for k, v in data.items()
-            }
-        if isinstance(data, list):
-            return [
-                item.to_dict() if isinstance(item, ConfigNode) else item
-                for item in data
-            ]
-        return data
+        if isinstance(value, ConfigNode):
+            return value.to_dict()
+        if isinstance(value, list):
+            return [self._convert_to_json(item) for item in value]
+        return value
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Recursively converts the ConfigNode tree to a pure Python dictionary.
+
+        This method produces a JSON-serializable structure. Nested ConfigNode
+        objects are recursively converted, and lists are fully expanded.
+
+        Returns:
+            A dictionary representing the complete configuration tree.
+        """
+        data = object.__getattribute__(self, "__data")
+        result: dict[str, Any] = {}
+        for key, value in data.items():
+            result[key] = self._convert_to_json(value)
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -254,21 +403,21 @@ class ConfigLoader:
     running in the same process to hold distinct configurations.
 
     Usage:
-        # Instantiate with the path to the config directory
         loader = ConfigLoader("configs")
-        
-        # Load once (caches the result)
         config = loader.load()
-        
-        # Access values
         print(config.model.person_detector.name)
-        
-        # For experiments, you can create separate loaders:
-        exp1_config = ConfigLoader("configs/exp1").load()
-        exp2_config = ConfigLoader("configs/exp2").load()
+
+        # Multiple independent loaders
+        exp1 = ConfigLoader("configs/experiment_a").load()
+        exp2 = ConfigLoader("configs/experiment_b").load()
+
+    Attributes:
+        _config_dir: The resolved configuration directory path.
+        _config: Cached ConfigNode (or None if not loaded).
+        _loaded: Whether the configuration has been successfully loaded.
     """
 
-    def __init__(self, config_dir: Union[str, Path] = "configs"):
+    def __init__(self, config_dir: str | Path = "configs") -> None:
         """
         Initializes the loader with a configuration directory path.
 
@@ -277,8 +426,8 @@ class ConfigLoader:
                         If relative, it resolves against the current working directory.
         """
         self._config_dir = _resolve_config_path(config_dir)
-        self._config: Optional[ConfigNode] = None
-        self._loaded = False
+        self._config: ConfigNode | None = None
+        self._loaded: bool = False
 
     def load(self) -> ConfigNode:
         """
@@ -295,6 +444,7 @@ class ConfigLoader:
             ConfigSyntaxError: If a YAML file contains invalid syntax.
             ConfigValidationError: If a configuration file has an invalid structure.
         """
+        # Return cached config if available
         if self._loaded and self._config is not None:
             return self._config
 
@@ -304,7 +454,7 @@ class ConfigLoader:
         _validate_required_files(config_path)
 
         # 2. Load root-level YAML files
-        root_data = {}
+        root_data: dict[str, Any] = {}
         for yaml_file in config_path.glob("*.yaml"):
             namespace = yaml_file.stem
             if namespace.endswith("_config"):
@@ -322,7 +472,7 @@ class ConfigLoader:
         # 3. Load the 'reasoning/' subdirectory (optional)
         reasoning_path = config_path / "reasoning"
         if reasoning_path.exists() and reasoning_path.is_dir():
-            reasoning_data = {}
+            reasoning_data: dict[str, Any] = {}
             for yaml_file in reasoning_path.glob("*.yaml"):
                 namespace = yaml_file.stem
                 if namespace.endswith("_config"):
@@ -343,29 +493,55 @@ class ConfigLoader:
                 )
             root_data["reasoning"] = reasoning_data
         else:
-            # Ensure an empty reasoning namespace exists to prevent downstream crashes.
+            # Ensure an empty reasoning namespace exists to prevent downstream crashes
             root_data["reasoning"] = {}
 
         # 4. Convert the raw dictionary tree into an immutable ConfigNode tree
-        #    using the specialized builder.
-        self._config = _build_config_tree(root_data)
+        config = _build_config_node(root_data)
+        self._config = config
         self._loaded = True
+        return config
 
-        return self._config
+    def reload(self) -> ConfigNode:
+        """
+        Forces a reload of the configuration from disk.
+
+        This is useful for development scenarios where configuration files
+        may change at runtime. It clears the cache and reloads everything.
+
+        Returns:
+            A fresh ConfigNode representing the updated configuration.
+
+        Raises:
+            Same exceptions as load().
+        """
+        # Clear the cache and reload
+        self._config = None
+        self._loaded = False
+        return self.load()
 
     def get_config(self) -> ConfigNode:
         """
         Returns the cached configuration.
 
+        This is a convenience method that raises a clear error if the
+        configuration has not been loaded yet.
+
+        Returns:
+            The cached ConfigNode.
+
         Raises:
             RuntimeError: If load() hasn't been called successfully before.
         """
-        if not self._loaded or self._config is None:
+        config = self._config
+        if not self._loaded or config is None:
             raise RuntimeError(
                 f"Configuration not loaded for loader (dir: {self._config_dir}). "
                 "Call .load() before attempting to access configuration values."
             )
-        return self._config
+        # Assert to help the type checker narrow the type
+        assert config is not None
+        return config
 
 
 # -----------------------------------------------------------------------------
